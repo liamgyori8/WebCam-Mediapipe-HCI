@@ -107,8 +107,8 @@ def keep_window_on_top(window_name):
 def move_cursor(x, y):
     ctypes.windll.user32.SetCursorPos(int(x), int(y))
 
-latest_command = ""
-latest_command_lock = threading.Lock()
+command_queue = deque(maxlen=10)
+command_queue_lock = threading.Lock()
 running = True
 last_overlay_text = ""
 last_overlay_update = 0
@@ -116,11 +116,9 @@ last_overlay_update = 0
 draw_overlay = DrawOverlay()
 
 def audio_worker():
-    global latest_command
-
     while running:
         audio = sd.rec(
-            int(2 * fs),
+            int(3 * fs),
             samplerate=fs,
             channels=1,
             dtype='int16'
@@ -139,11 +137,11 @@ def audio_worker():
         raw_text = raw_text.translate(str.maketrans('', '', string.punctuation))
         raw_text = raw_text.lower()
 
-        with latest_command_lock:
-            latest_command = raw_text
+        if raw_text:
+            with command_queue_lock:
+                command_queue.append(raw_text)
 
-        if latest_command:
-            print("Heard:", latest_command)
+            print("Heard:", raw_text)
 
 fs = 16000
 
@@ -187,7 +185,7 @@ prev_y = None
 prev_scroll_y = 0
 last_click_time = 0
 cursor_history = deque(maxlen=1)
-click_threshold = 0.05
+click_threshold = 0.035
 smoothening = 0.50
 movement_deadzone = 2
 tracking_margin = 0.08
@@ -208,10 +206,8 @@ with GestureRecognizer.create_from_options(gesture_options) as recognizer:
 
         while True:
 
-            with latest_command_lock:
-                command = latest_command
-                if command:
-                    latest_command = ""
+            with command_queue_lock:
+                command = command_queue.popleft() if command_queue else ""
 
             if typing_mode:
                  
@@ -220,6 +216,8 @@ with GestureRecognizer.create_from_options(gesture_options) as recognizer:
                     draw_mode = False
                     set_overlay("Mode: Normal")
                     print("Exited typing mode")
+                 elif "undo" in command:
+                    pyautogui.hotkey("ctrl", "z")
                  elif command:
                     pyautogui.write(command + " ")
             else: 
@@ -237,6 +235,11 @@ with GestureRecognizer.create_from_options(gesture_options) as recognizer:
                     typing_mode = True
                     set_overlay("Mode: Typing")
                     print("Entering typing mode")
+                elif "open" in command:
+                    pyautogui.mouseDown()
+                    pyautogui.mouseUp()
+                    pyautogui.mouseDown()
+                    pyautogui.mouseUp()
                 elif "delete" in command or "backspace" in command:
                     pyautogui.press("backspace")
                 elif "draw" in command: 
@@ -245,6 +248,7 @@ with GestureRecognizer.create_from_options(gesture_options) as recognizer:
                     draw_overlay.update()
                     set_overlay("Mode: Draw")
                     print("Entering draw mode")
+                
                 elif "stop" in command or "exit" in command or "quit" in command:
                     draw_mode = False
                     draw_overlay.points.clear()
@@ -328,7 +332,7 @@ with GestureRecognizer.create_from_options(gesture_options) as recognizer:
                         app.processEvents()
 
                     pinch_distance = ((index_tip.x - thumb_tip.x) ** 2 + (index_tip.y - thumb_tip.y) ** 2) ** 0.5
-                    if pinch_distance < click_threshold and time.time() - last_click_time > 0.5:
+                    if pinch_distance < click_threshold and time.time() - last_click_time > 1.0:
                         pyautogui.click()
                         last_click_time = time.time()
                         set_overlay("Pinch Click")
@@ -341,6 +345,10 @@ with GestureRecognizer.create_from_options(gesture_options) as recognizer:
                         confidence = result.gestures[0][0].score
 
                         if typing_mode:
+                            if gesture == "Open_Palm":
+                                pyautogui.press("enter")
+                            elif gesture == "Closed_Fist":
+                                pyautogui.press("backspace")
                             set_overlay(f"Mode: Typing\nGesture: {gesture}" )
                         elif draw_mode:
                             set_overlay(f"Mode: Draw\nGesture: {gesture}" )
@@ -358,16 +366,6 @@ with GestureRecognizer.create_from_options(gesture_options) as recognizer:
                                 pyautogui.scroll(-100)
                             else:
                                 pyautogui.scroll(100)
-
-            if typing_mode:
-                if command and ("stop" in command or "exit" in command or "quit" in command):
-                    typing_mode = False
-                    set_overlay("Mode: Normal")
-                    print("Exited typing mode")
-
-                elif command:
-                    pyautogui.write(command + " ")
-                    set_overlay(f"Typing: {command}")
 
             cv2.imshow(window_name, frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
