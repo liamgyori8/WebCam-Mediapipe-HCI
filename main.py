@@ -13,6 +13,9 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPainter, QPen
 import sys
 
+PEN_WIDTH = 4
+ERASER_RADIUS = 36
+
 app = QApplication(sys.argv)
 
 label = QLabel("Tracking")
@@ -76,17 +79,50 @@ class DrawOverlay(QWidget):
         painter = QPainter(self)
 
         pen = QPen(Qt.GlobalColor.green)
-        pen.setWidth(4)
+        pen.setWidth(PEN_WIDTH)
 
         painter.setPen(pen)
 
         for i in range(1, len(self.points)):
+            if self.points[i - 1] is None or self.points[i] is None:
+                continue
+
             painter.drawLine(
                 self.points[i - 1][0],
                 self.points[i - 1][1],
                 self.points[i][0],
                 self.points[i][1]
             )
+
+    def erase_at(self, x, y, radius):
+        radius_squared = radius * radius
+        erased_points = []
+        previous_was_erased = False
+
+        for point in self.points:
+            if point is None:
+                if erased_points and erased_points[-1] is not None:
+                    erased_points.append(None)
+                previous_was_erased = False
+                continue
+
+            point_x, point_y = point
+            should_erase = (point_x - x) ** 2 + (point_y - y) ** 2 <= radius_squared
+
+            if should_erase:
+                if erased_points and erased_points[-1] is not None:
+                    erased_points.append(None)
+                previous_was_erased = True
+            else:
+                if previous_was_erased and erased_points and erased_points[-1] is not None:
+                    erased_points.append(None)
+                erased_points.append(point)
+                previous_was_erased = False
+
+        while erased_points and erased_points[-1] is None:
+            erased_points.pop()
+
+        self.points = erased_points
 
 
 def keep_window_on_top(window_name):
@@ -146,7 +182,7 @@ def audio_worker():
 fs = 16000
 
 model = WhisperModel("base",device="cpu",compute_type="int8")
-gesture_model_path = ('C:\\Users\\liam\\Documents\\GitHub\\Hand_Control\\gesture_recognizer.task')
+gesture_model_path = "gesture_recognizer.task"
 
 BaseOptions = mp.tasks.BaseOptions
 GestureRecognizer = mp.tasks.vision.GestureRecognizer
@@ -326,8 +362,18 @@ with GestureRecognizer.create_from_options(gesture_options) as recognizer:
                     prev_x = curr_x
                     prev_y = curr_y
 
+                    gesture = None
+                    confidence = 0
+
+                    if result.gestures:
+                        gesture = result.gestures[0][0].category_name
+                        confidence = result.gestures[0][0].score
+
                     if draw_mode:
-                        draw_overlay.points.append((int(curr_x), int(curr_y)))
+                        if gesture == "Closed_Fist":
+                            draw_overlay.erase_at(int(curr_x), int(curr_y), ERASER_RADIUS)
+                        else:
+                            draw_overlay.points.append((int(curr_x), int(curr_y)))
                         draw_overlay.update()
                         app.processEvents()
 
@@ -339,11 +385,7 @@ with GestureRecognizer.create_from_options(gesture_options) as recognizer:
 
                     cv2.circle(frame,(x, y),15,(255, 0, 255),-1)
 
-                    if result.gestures:
-
-                        gesture = result.gestures[0][0].category_name
-                        confidence = result.gestures[0][0].score
-
+                    if gesture:
                         if typing_mode:
                             if gesture == "Open_Palm":
                                 pyautogui.press("enter")
