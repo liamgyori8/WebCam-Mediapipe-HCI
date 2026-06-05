@@ -7,6 +7,7 @@ import time
 from faster_whisper import WhisperModel
 import sounddevice as sd
 import threading
+import queue
 from collections import deque
 from PyQt6.QtWidgets import QApplication, QLabel, QWidget
 from PyQt6.QtCore import Qt
@@ -15,32 +16,7 @@ import sys
 
 PEN_WIDTH = 4
 ERASER_RADIUS = 36
-
-app = QApplication(sys.argv)
-
-label = QLabel("Tracking")
-label.setStyleSheet("""
-    background-color: rgba(0, 0, 0, 150);
-    color: lime;
-    font-size: 24px;
-    padding: 10px;
-    border-radius: 10px;
-""")
-
-label.setWindowFlags(
-    Qt.WindowType.FramelessWindowHint
-    | Qt.WindowType.WindowStaysOnTopHint
-    | Qt.WindowType.Tool
-)
-
-label.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-label.setAttribute(
-    Qt.WidgetAttribute.WA_TransparentForMouseEvents
-)
-
-label.move(20, 20)
-label.resize(600, 100)
-label.show()
+FINGER_WIDTH = 6
 
 def set_overlay(text):
     global last_overlay_text, last_overlay_update
@@ -51,9 +27,7 @@ def set_overlay(text):
 
     last_overlay_text = text
     last_overlay_update = now
-    label.setText(text)
-    label.adjustSize()
-    app.processEvents()
+    overlay_thread.set_text(text)
 
 
 class DrawOverlay(QWidget):
@@ -62,6 +36,8 @@ class DrawOverlay(QWidget):
         super().__init__()
 
         self.points = []
+        self.lines = []
+        self.mode = "nothing"
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -78,21 +54,39 @@ class DrawOverlay(QWidget):
 
         painter = QPainter(self)
 
-        pen = QPen(Qt.GlobalColor.green)
-        pen.setWidth(PEN_WIDTH)
+        if self.mode == "show":
+            pen = QPen(Qt.GlobalColor.red)
+            pen.setWidth(FINGER_WIDTH)
+            painter.setPen(pen)
+            for line in self.lines:
+                start_point, end_point = line
+                painter.drawLine(
+                    start_point[0],
+                    start_point[1],
+                    end_point[0],
+                    end_point[1]
+                )
+            painter.setPen(QPen(Qt.GlobalColor.blue))
+            for point in self.points:
+                if point is None:
+                    continue
+                painter.drawEllipse(point[0] - 6, point[1] - 6, 12, 12)
+        else:        
+            pen = QPen(Qt.GlobalColor.green)
+            pen.setWidth(PEN_WIDTH)
 
-        painter.setPen(pen)
+            painter.setPen(pen)
 
-        for i in range(1, len(self.points)):
-            if self.points[i - 1] is None or self.points[i] is None:
-                continue
+            for i in range(1, len(self.points)):
+                if self.points[i - 1] is None or self.points[i] is None:
+                    continue
 
-            painter.drawLine(
-                self.points[i - 1][0],
-                self.points[i - 1][1],
-                self.points[i][0],
-                self.points[i][1]
-            )
+                painter.drawLine(
+                    self.points[i - 1][0],
+                    self.points[i - 1][1],
+                    self.points[i][0],
+                    self.points[i][1]
+                )
 
     def erase_at(self, x, y, radius):
         radius_squared = radius * radius
@@ -125,6 +119,95 @@ class DrawOverlay(QWidget):
         self.points = erased_points
 
 
+class OverlayThread:
+
+    def __init__(self):
+        self.commands = queue.Queue()
+        self.app = QApplication(sys.argv)
+        self.label = QLabel("Tracking")
+        self.label.setStyleSheet("""
+            background-color: rgba(0, 0, 0, 150);
+            color: lime;
+            font-size: 24px;
+            padding: 10px;
+            border-radius: 10px;
+        """)
+
+        self.label.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+
+        self.label.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+        self.label.move(20, 20)
+        self.label.resize(600, 100)
+        self.label.show()
+
+        self.draw_overlay = DrawOverlay()
+        self.running = True
+
+    def process_commands(self):
+        while True:
+            try:
+                command, payload = self.commands.get_nowait()
+            except queue.Empty:
+                break
+
+            if command == "text":
+                self.label.setText(payload)
+                self.label.adjustSize()
+            elif command == "mode":
+                self.draw_overlay.mode = payload
+            elif command == "clear":
+                self.draw_overlay.points.clear()
+                self.draw_overlay.lines.clear()
+                self.draw_overlay.update()
+            elif command == "show_points":
+                points, lines = payload
+                self.draw_overlay.points = points
+                self.draw_overlay.lines = lines
+                self.draw_overlay.update()
+            elif command == "append_point":
+                self.draw_overlay.points.append(payload)
+                self.draw_overlay.update()
+            elif command == "erase":
+                x, y, radius = payload
+                self.draw_overlay.erase_at(x, y, radius)
+                self.draw_overlay.update()
+            elif command == "stop":
+                self.running = False
+
+        self.app.processEvents()
+
+    def set_text(self, text):
+        self.commands.put(("text", text))
+
+    def set_mode(self, mode):
+        self.commands.put(("mode", mode))
+
+    def clear(self):
+        self.commands.put(("clear", None))
+
+    def set_show_points(self, points, lines):
+        self.commands.put(("show_points", (points, lines)))
+
+    def append_point(self, point):
+        self.commands.put(("append_point", point))
+
+    def erase_at(self, x, y, radius):
+        self.commands.put(("erase", (x, y, radius)))
+
+    def stop(self):
+        self.commands.put(("stop", None))
+        self.process_commands()
+        self.label.close()
+        self.draw_overlay.close()
+        self.app.quit()
+
+
 def keep_window_on_top(window_name):
     try:
         hwnd = ctypes.windll.user32.FindWindowW(None, window_name)
@@ -143,13 +226,40 @@ def keep_window_on_top(window_name):
 def move_cursor(x, y):
     ctypes.windll.user32.SetCursorPos(int(x), int(y))
 
+
+def smooth_landmark_points(hand_landmarks):
+    smoothed_points = []
+
+    for index, landmark in enumerate(hand_landmarks):
+        mapped_x = (landmark.x - tracking_margin) / (1 - 2 * tracking_margin)
+        mapped_y = (landmark.y - tracking_margin) / (1 - 2 * tracking_margin)
+
+        screen_x = min(max(int(mapped_x * screen_w), 0), screen_w - 1)
+        screen_y = min(max(int(mapped_y * screen_h), 0), screen_h - 1)
+
+        hand_point_histories[index].append((screen_x, screen_y))
+        avg_screen_x = sum(point[0] for point in hand_point_histories[index]) / len(hand_point_histories[index])
+        avg_screen_y = sum(point[1] for point in hand_point_histories[index]) / len(hand_point_histories[index])
+
+        previous_point = previous_hand_points[index]
+        if previous_point is None:
+            previous_point = (avg_screen_x, avg_screen_y)
+
+        curr_x = previous_point[0] + (avg_screen_x - previous_point[0]) * smoothening
+        curr_y = previous_point[1] + (avg_screen_y - previous_point[1]) * smoothening
+
+        previous_hand_points[index] = (curr_x, curr_y)
+        smoothed_points.append((curr_x, curr_y))
+
+    return smoothed_points
+
 command_queue = deque(maxlen=10)
 command_queue_lock = threading.Lock()
 running = True
 last_overlay_text = ""
 last_overlay_update = 0
 
-draw_overlay = DrawOverlay()
+overlay_thread = OverlayThread()
 
 def audio_worker():
     while running:
@@ -216,15 +326,14 @@ pyautogui.FAILSAFE = False
 pyautogui.MINIMUM_DURATION = 0
 pyautogui.MINIMUM_SLEEP = 0
 
-prev_x = None
-prev_y = None
 prev_scroll_y = 0
 last_click_time = 0
-cursor_history = deque(maxlen=1)
 click_threshold = 0.035
 smoothening = 0.50
 movement_deadzone = 2
 tracking_margin = 0.08
+hand_point_histories = [deque(maxlen=1) for _ in range(21)]
+previous_hand_points = [None] * 21
 
 audio_thread = threading.Thread(target=audio_worker, daemon=True)
 
@@ -237,6 +346,8 @@ with GestureRecognizer.create_from_options(gesture_options) as recognizer:
     draw_mode = False
 
     break_draw = False
+
+    show_hand = False
 
     try:
 
@@ -280,17 +391,26 @@ with GestureRecognizer.create_from_options(gesture_options) as recognizer:
                     pyautogui.press("backspace")
                 elif "draw" in command: 
                     draw_mode = True
-                    draw_overlay.points.clear()
-                    draw_overlay.update()
+                    overlay_thread.clear()
+                    overlay_thread.set_mode("draw")
                     set_overlay("Mode: Draw")
                     print("Entering draw mode")
                 
                 elif "stop" in command or "exit" in command or "quit" in command:
                     draw_mode = False
-                    draw_overlay.points.clear()
-                    draw_overlay.update()
+                    show_hand = False
+                    overlay_thread.clear()
                     set_overlay("Mode: Normal")
                     print("Exited draw mode")
+                elif "show" in command:
+                    set_overlay("Mode: show hand")
+                    show_hand = True
+                    overlay_thread.set_mode("show")
+                elif "hide" in command: 
+                    set_overlay("Mode: Normal")
+                    show_hand = False
+                    overlay_thread.clear()
+                
 
             success, frame = cap.read()
 
@@ -303,17 +423,11 @@ with GestureRecognizer.create_from_options(gesture_options) as recognizer:
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
            
-            mp_image = mp.Image(
-                image_format=mp.ImageFormat.SRGB,
-                data=rgb_frame
-            )
+            mp_image = mp.Image( image_format=mp.ImageFormat.SRGB,data=rgb_frame)
 
             timestamp = int(time.time() * 1000)
 
-            result = recognizer.recognize_for_video(
-                mp_image,
-                timestamp
-            )
+            result = recognizer.recognize_for_video(mp_image,timestamp)
 
         
             if result.hand_landmarks:
@@ -330,37 +444,26 @@ with GestureRecognizer.create_from_options(gesture_options) as recognizer:
 
                     index_tip = hand_landmarks[8]
                     middle_tip = hand_landmarks[12]
+                    ring_tip = hand_landmarks[16]
+                    pinky_tip = hand_landmarks[20]
                     thumb_tip = hand_landmarks[4]
                     palm_base = hand_landmarks[0]
 
-                    x = int(index_tip.x * w)
-                    y = int(index_tip.y * h)
+                    x1 = int(index_tip.x * w)
+                    y1 = int(index_tip.y * h)
 
-                    x2 = int(middle_tip.x * w)
-                    y2 = int(middle_tip.y * h)
+                    previous_cursor_point = previous_hand_points[8]
+                    smoothed_hand_points = smooth_landmark_points(hand_landmarks)
 
-                    mapped_x = (index_tip.x - tracking_margin) / (1 - 2 * tracking_margin)
-                    mapped_y = (index_tip.y - tracking_margin) / (1 - 2 * tracking_margin)
+                    curr_x1, curr_y1 = smoothed_hand_points[8]
+                    curr_x2, curr_y2 = smoothed_hand_points[12]
+                    curr_x3, curr_y3 = smoothed_hand_points[16]
+                    curr_x4, curr_y4 = smoothed_hand_points[20]
+                    curr_x5, curr_y5 = smoothed_hand_points[4]
 
-                    screen_x = min(max(int(mapped_x * screen_w), 0), screen_w - 1)
-                    screen_y = min(max(int(mapped_y * screen_h), 0), screen_h - 1)
-
-                    cursor_history.append((screen_x, screen_y))
-                    avg_screen_x = sum(pt[0] for pt in cursor_history) / len(cursor_history)
-                    avg_screen_y = sum(pt[1] for pt in cursor_history) / len(cursor_history)
-
-                    if prev_x is None or prev_y is None:
-                        prev_x = avg_screen_x
-                        prev_y = avg_screen_y
-
-                    curr_x = prev_x + (avg_screen_x - prev_x) * smoothening
-                    curr_y = prev_y + (avg_screen_y - prev_y) * smoothening
-
-                    if abs(curr_x - prev_x) > movement_deadzone or abs(curr_y - prev_y) > movement_deadzone:
-                        move_cursor(curr_x, curr_y)
-
-                    prev_x = curr_x
-                    prev_y = curr_y
+                    if previous_cursor_point is not None:
+                        if abs(curr_x1 - previous_cursor_point[0]) > movement_deadzone or abs(curr_y1 - previous_cursor_point[1]) > movement_deadzone:
+                            move_cursor(curr_x1, curr_y1)
 
                     gesture = None
                     confidence = 0
@@ -368,14 +471,34 @@ with GestureRecognizer.create_from_options(gesture_options) as recognizer:
                     if result.gestures:
                         gesture = result.gestures[0][0].category_name
                         confidence = result.gestures[0][0].score
+                    
+                    if show_hand:
+                        overlay_points = []
+                        for point_x, point_y in smoothed_hand_points:
+                            overlay_points.append((int(point_x), int(point_y)))
+
+                        hand_connections = [
+                            (0, 1), (1, 2), (2, 3), (3, 4),
+                            (0, 5), (5, 6), (6, 7), (7, 8),
+                            (0, 9), (9, 10), (10, 11), (11, 12),
+                            (0, 13), (13, 14), (14, 15), (15, 16),
+                            (0, 17), (17, 18), (18, 19), (19, 20),
+                            (5, 9), (9, 13), (13, 17)
+                        ]
+                        overlay_lines = []
+                        for start_index, end_index in hand_connections:
+                            overlay_lines.append((
+                                overlay_points[start_index],
+                                overlay_points[end_index]
+                            ))
+
+                        overlay_thread.set_show_points(overlay_points, overlay_lines)
 
                     if draw_mode:
                         if gesture == "Closed_Fist":
-                            draw_overlay.erase_at(int(curr_x), int(curr_y), ERASER_RADIUS)
+                            overlay_thread.erase_at(int(curr_x1), int(curr_y1), ERASER_RADIUS)
                         else:
-                            draw_overlay.points.append((int(curr_x), int(curr_y)))
-                        draw_overlay.update()
-                        app.processEvents()
+                            overlay_thread.append_point((int(curr_x1), int(curr_y1)))
 
                     pinch_distance = ((index_tip.x - thumb_tip.x) ** 2 + (index_tip.y - thumb_tip.y) ** 2) ** 0.5
                     if pinch_distance < click_threshold and time.time() - last_click_time > 1.0:
@@ -383,7 +506,7 @@ with GestureRecognizer.create_from_options(gesture_options) as recognizer:
                         last_click_time = time.time()
                         set_overlay("Pinch Click")
 
-                    cv2.circle(frame,(x, y),15,(255, 0, 255),-1)
+                    cv2.circle(frame,(x1, y1),15,(255, 0, 255),-1)
 
                     if gesture:
                         if typing_mode:
@@ -394,6 +517,8 @@ with GestureRecognizer.create_from_options(gesture_options) as recognizer:
                             set_overlay(f"Mode: Typing\nGesture: {gesture}" )
                         elif draw_mode:
                             set_overlay(f"Mode: Draw\nGesture: {gesture}" )
+                        elif show_hand:
+                            set_overlay(f"Mode: Show Hand\nGesture: {gesture}" )
                         else:
                             set_overlay(f"Mode: Normal\nGesture: {gesture}" )
                         if gesture == "Thumb_Up":
@@ -410,6 +535,7 @@ with GestureRecognizer.create_from_options(gesture_options) as recognizer:
                                 pyautogui.scroll(100)
 
             cv2.imshow(window_name, frame)
+            overlay_thread.process_commands()
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
@@ -421,6 +547,5 @@ with GestureRecognizer.create_from_options(gesture_options) as recognizer:
             cap.release()
             cv2.destroyAllWindows()
             audio_thread.join(timeout=2)
+            overlay_thread.stop()
             print("Shutdown complete.")
-            label.close()
-            app.quit()
